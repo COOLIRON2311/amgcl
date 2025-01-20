@@ -1,0 +1,9 @@
+.git
+.travis
+.travis.yml
+.vscode
+delphi
+fortran
+pyamgcl
+build
+docker
