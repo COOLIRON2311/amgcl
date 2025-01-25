@@ -1,6 +1,6 @@
 #include <vector>
 #include <iostream>
-#include <fstream>
+#include "util.h"
 
 #include <amgcl/backend/vexcl.hpp>
 #include <amgcl/backend/vexcl_static_matrix.hpp>
@@ -9,7 +9,7 @@
 #include <amgcl/amg.hpp>
 #include <amgcl/coarsening/smoothed_aggregation.hpp>
 #include <amgcl/relaxation/spai0.hpp>
-#include <amgcl/solver/cg.hpp>
+#include <amgcl/solver/bicgstab.hpp>
 #include <amgcl/value_type/static_matrix.hpp>
 #include <amgcl/adapter/block_matrix.hpp>
 
@@ -19,11 +19,13 @@
 int main(int argc, char *argv[])
 {
     // The command line should contain the matrix file name:
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <matrix.mtx> <solution.bin>" << std::endl;
+    if (argc < 4)
+    {
+        std::cerr << "Usage: " << argv[0] << " <matrix.mtx> <rhs.txt> <solution.txt>" << std::endl;
         return 1;
     }
 
+#pragma region VexCL setup
     // Create VexCL context. Set the environment variable OCL_DEVICE to
     // control which GPU to use in case multiple are available,
     // and use single device:
@@ -31,12 +33,14 @@ int main(int argc, char *argv[])
     std::cout << ctx << std::endl;
 
     // Enable support for block-valued matrices in the VexCL kernels:
-    vex::scoped_program_header h1(ctx, amgcl::backend::vexcl_static_matrix_declaration<double,3>());
-    vex::scoped_program_header h2(ctx, amgcl::backend::vexcl_static_matrix_declaration<float,3>());
+    vex::scoped_program_header h1(ctx, amgcl::backend::vexcl_static_matrix_declaration<double, 3>());
+    vex::scoped_program_header h2(ctx, amgcl::backend::vexcl_static_matrix_declaration<float, 3>());
+#pragma endregion
 
     // The profiler:
-    amgcl::profiler<> prof("Serena (VexCL)");
+    amgcl::profiler<> prof("Eigen (VexCL)");
 
+#pragma region Matrix setup
     // Read the system matrix:
     ptrdiff_t rows, cols;
     std::vector<ptrdiff_t> ptr, col;
@@ -47,10 +51,16 @@ int main(int argc, char *argv[])
     std::cout << "Matrix " << argv[1] << ": " << rows << "x" << cols << std::endl;
     prof.toc("read");
 
-    // The RHS is filled with ones:
-    std::vector<double> f(rows, 1.0);
+    // We use the tuple of CRS arrays to represent the system matrix.
+    // Note that std::tie creates a tuple of references, so no data is actually
+    // copied here:
+    auto A = std::tie(rows, ptr, col, val);
+#pragma endregion
 
-    // Scale the matrix so that it has the unit diagonal.
+    // The RHS is loaded from file:
+    std::vector<double> f = load_rhs<double>(argv[2], rows);
+
+    /*// Scale the matrix so that it has the unit diagonal.
     // First, find the diagonal values:
     std::vector<double> D(rows, 1.0);
     for(ptrdiff_t i = 0; i < rows; ++i) {
@@ -68,17 +78,13 @@ int main(int argc, char *argv[])
             val[j] *= D[i] * D[col[j]];
         }
         f[i] *= D[i];
-    }
+    }*/
 
-    // We use the tuple of CRS arrays to represent the system matrix.
-    // Note that std::tie creates a tuple of references, so no data is actually
-    // copied here:
-    auto A = std::tie(rows, ptr, col, val);
-
+#pragma region Solver setup
     // Compose the solver type
     typedef amgcl::static_matrix<double, 3, 3> dmat_type; // matrix value type in double precision
     typedef amgcl::static_matrix<double, 3, 1> dvec_type; // the corresponding vector value type
-    typedef amgcl::static_matrix<float,  3, 3> smat_type; // matrix value type in single precision
+    typedef amgcl::static_matrix<float, 3, 3> smat_type;  // matrix value type in single precision
 
     typedef amgcl::backend::vexcl<dmat_type> SBackend; // the solver backend
     typedef amgcl::backend::vexcl<smat_type> PBackend; // the preconditioner backend
@@ -87,29 +93,29 @@ int main(int argc, char *argv[])
         amgcl::amg<
             PBackend,
             amgcl::coarsening::smoothed_aggregation,
-            amgcl::relaxation::spai0
-            >,
-        amgcl::solver::cg<SBackend>
-        > Solver;
+            amgcl::relaxation::spai0>,
+        amgcl::solver::bicgstab<SBackend>>
+        Solver;
 
     // Solver parameters
-    Solver::params prm;
-    prm.solver.maxiter = 500;
+    Solver::params params;
+    params.solver.maxiter = 500;
 
     // Set the VexCL context in the backend parameters
-    SBackend::params bprm;
-    bprm.q = ctx;
+    SBackend::params be_params;
+    be_params.q = ctx;
 
     // Initialize the solver with the system matrix.
     // We use the block_matrix adapter to convert the matrix into the block
     // format on the fly:
     prof.tic("setup");
     auto Ab = amgcl::adapter::block_matrix<dmat_type>(A);
-    Solver solve(Ab, prm, bprm);
+    Solver solve(Ab, params, be_params);
     prof.toc("setup");
 
     // Show the mini-report on the constructed solver:
     std::cout << solve << std::endl;
+#pragma endregion
 
     // Solve the system with the zero initial approximation:
     int iters;
@@ -119,13 +125,13 @@ int main(int argc, char *argv[])
     // Since we are using mixed precision, we have to transfer the system matrix to the GPU:
     prof.tic("GPU matrix");
     auto A_gpu = SBackend::copy_matrix(
-            std::make_shared<amgcl::backend::crs<dmat_type>>(Ab), bprm);
+        std::make_shared<amgcl::backend::crs<dmat_type>>(Ab), be_params);
     prof.toc("GPU matrix");
 
     // We reinterpret both the RHS and the solution vectors as block-valued,
     // and copy them to the VexCL vectors:
-    auto f_ptr = reinterpret_cast<dvec_type*>(f.data());
-    auto x_ptr = reinterpret_cast<dvec_type*>(x.data());
+    auto f_ptr = reinterpret_cast<dvec_type *>(f.data());
+    auto x_ptr = reinterpret_cast<dvec_type *>(x.data());
     vex::vector<dvec_type> F(ctx, rows / 3, f_ptr);
     vex::vector<dvec_type> X(ctx, rows / 3, x_ptr);
 
@@ -140,10 +146,8 @@ int main(int argc, char *argv[])
               << prof << std::endl;
 
     std::cout << "Saving solution..." << std::endl;
-    std::vector<dvec_type> sol_buf(X.size());
-    X.read_data(0, X.size() * sizeof(dvec_type), sol_buf.data(), true);
 
-    std::ofstream ofs(argv[2], std::ios::binary);
-    if (ofs.is_open())
-        ofs.write(reinterpret_cast<const char*>(sol_buf.data()), X.size() * sizeof(dvec_type));
+    std::vector<dvec_type> solution(X.size());
+    X.read_data(0, X.size() * sizeof(dvec_type), solution.data(), true);
+    save_solution<double>(argv[3], solution, rows);
 }

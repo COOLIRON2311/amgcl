@@ -13,3 +13,4 @@ __pycache__
 *.bundle
 .vscode
 *.bin
+*.xz
